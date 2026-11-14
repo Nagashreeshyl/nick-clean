@@ -1,0 +1,130 @@
+#!/bin/bash
+# nick-clean: list hidden junk (caches, leftovers of uninstalled apps) with sizes, delete what you pick.
+# Written for bash 3.2 (the version macOS ships).
+
+MIN_KB=${NICK_CLEAN_MIN_KB:-10240}   # hide items under 10 MB
+APP_DIRS=${NICK_CLEAN_APP_DIRS:-"/Applications $HOME/Applications"}
+
+if [ "$(id -u)" = 0 ]; then echo "Don't run nick-clean with sudo."; exit 1; fi
+if [ -z "$HOME" ] || [ "$HOME" = / ]; then echo "HOME is not set properly."; exit 1; fi
+
+human() { awk -v k="$1" 'BEGIN{ split("KB MB GB TB",u); i=1; while(k>=1024&&i<4){k/=1024;i++} printf "%.1f %s", k, u[i] }'; }
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -d ' '; }
+
+# Folders macOS itself needs (or personal data like iPhone backups) - never offered.
+SKIP=" addressbook animoji callhistorydb callhistorytransactions clouddocs crashreporter differentialprivacy knowledge mobilesync keychains mail messages safari photos icloud accounts cloudkit familycircle fileprovider homekit metadata mobiledocuments .ssh .gnupg .zsh_sessions .local "
+is_skipped() { case "$SKIP" in *" $(lower "$1") "*) return 0;; esac; case "$1" in com.apple.*|group.com.apple.*|*.com.apple.*) return 0;; esac; return 1; }
+
+CACHE_DOTS=" .cache .npm .gradle .konan .trash .cocoapods .m2 .pub-cache .yarn .node-gyp .expo .android "
+
+# --- installed apps: names + bundle ids + vendor (com.<vendor>.app) ---
+echo "Scanning installed apps..."
+KEYS=" "
+for d in $APP_DIRS; do
+  for app in "$d"/*.app; do
+    [ -d "$app" ] || continue
+    name=$(basename "$app" .app)
+    bid=$(defaults read "$app/Contents/Info" CFBundleIdentifier 2>/dev/null)
+    vendor=$(printf '%s' "$bid" | cut -d. -f2)
+    KEYS="$KEYS$(lower "$name") $(lower "$bid") "
+    [ ${#vendor} -ge 4 ] && KEYS="$KEYS$(lower "$vendor") "
+  done
+done
+belongs_to_app() {  # is folder name $1 owned by an installed app? Errs toward "yes" (safer).
+  local n k; n=$(lower "$1")
+  for k in $KEYS; do
+    [ ${#k} -ge 4 ] || continue
+    case "$n" in *"$k"*) return 0;; esac
+    [ ${#n} -ge 4 ] && case "$k" in *"$n"*) return 0;; esac
+  done
+  return 1
+}
+
+# --- scan ---
+LIST=$(mktemp); trap 'rm -f "$LIST"' EXIT
+add() {  # add <path> <label>
+  local kb; kb=$(du -sk "$1" 2>/dev/null | cut -f1)
+  [ -n "$kb" ] && [ "$kb" -ge "$MIN_KB" ] && printf '%s\t%s\t%s\n' "$kb" "$2" "$1" >> "$LIST"
+}
+echo "Scanning hidden folders (takes a minute)..."
+for p in "$HOME"/.[!.]*; do
+  [ -e "$p" ] || continue
+  b=$(basename "$p"); is_skipped "$b" && continue
+  [ "$b" = .cache ] && continue  # its subfolders are listed one by one below
+  case "$CACHE_DOTS" in *" $(lower "$b") "*) add "$p" CACHE;; *) add "$p" TOOL;; esac
+done
+for p in "$HOME"/.cache/*; do [ -e "$p" ] && add "$p" CACHE; done
+for sub in "Caches" "Logs"; do
+  for p in "$HOME/Library/$sub"/*; do
+    [ -e "$p" ] || continue; is_skipped "$(basename "$p")" || add "$p" CACHE
+  done
+done
+for sub in "Application Support" "Containers" "Group Containers" "Preferences" "Saved Application State" "HTTPStorages" "WebKit"; do
+  for p in "$HOME/Library/$sub"/*; do
+    [ -e "$p" ] || continue
+    b=$(basename "$p"); is_skipped "$b" && continue
+    if belongs_to_app "$b"; then add "$p" "APP DATA"; else add "$p" LEFTOVER; fi
+  done
+done
+
+SIZES=(); LABELS=(); PATHS=(); i=0
+while IFS=$'\t' read -r kb label path; do
+  i=$((i+1)); SIZES[i]=$kb; LABELS[i]=$label; PATHS[i]=$path
+done < <(sort -rn "$LIST")
+N=$i
+[ "$N" -eq 0 ] && { echo "Nothing over $(human "$MIN_KB") found. Clean already!"; exit 0; }
+
+# --- show ---
+echo
+echo "LEFTOVER = probably from an app you deleted   CACHE = safe, rebuilt automatically"
+echo "APP DATA = an installed app's data (resets it) TOOL = dev tool / config (uninstalls it)"
+echo
+printf '%4s  %9s  %-8s  %s\n' "#" "SIZE" "TYPE" "PATH"
+total=0
+for i in $(seq 1 "$N"); do
+  printf '%4s  %9s  %-8s  %s\n' "$i" "$(human "${SIZES[i]}")" "${LABELS[i]}" "~${PATHS[i]#$HOME}"
+  total=$((total + SIZES[i]))
+done
+echo "      total shown: $(human $total)"
+echo
+
+# --- select ---
+printf "Enter numbers to delete (e.g. 1 3 5-8), 'leftover', 'cache', or q to quit: "
+read -r answer || exit 0
+PICK=" "
+for tok in $answer; do
+  case "$tok" in
+    q|Q) echo "Nothing deleted."; exit 0;;
+    leftover|cache) want=$(echo "$tok" | tr '[:lower:]' '[:upper:]')
+      for i in $(seq 1 "$N"); do [ "${LABELS[i]}" = "$want" ] && PICK="$PICK$i "; done;;
+    *-*) a=${tok%-*}; b=${tok#*-}
+      case "$a$b" in *[!0-9]*|"") echo "Bad input: $tok"; exit 1;; esac
+      for i in $(seq "$a" "$b"); do PICK="$PICK$i "; done;;
+    *) case "$tok" in *[!0-9]*) echo "Bad input: $tok"; exit 1;; esac; PICK="$PICK$tok ";;
+  esac
+done
+CHOSEN=(); sel=0
+for i in $(seq 1 "$N"); do
+  case "$PICK" in *" $i "*) CHOSEN+=("$i"); sel=$((sel + SIZES[i]));; esac
+done
+[ ${#CHOSEN[@]} -eq 0 ] && { echo "Nothing selected."; exit 0; }
+
+# --- confirm + delete ---
+echo; echo "Will permanently delete:"
+for i in "${CHOSEN[@]}"; do printf '  %9s  %s\n' "$(human "${SIZES[i]}")" "~${PATHS[i]#$HOME}"; done
+echo "  total: $(human $sel)"
+printf "Type yes to delete: "
+read -r ok
+[ "$ok" = yes ] || { echo "Cancelled. Nothing deleted."; exit 0; }
+
+before=$(df -k / | awk 'NR==2{print $4}')
+for i in "${CHOSEN[@]}"; do
+  p=${PATHS[i]}
+  case "$p" in "$HOME"/?*) ;; *) echo "SKIP (outside home): $p"; continue;; esac
+  case "$p" in */../*|*/..) echo "SKIP (odd path): $p"; continue;; esac
+  if rm -rf "$p" 2>/dev/null && [ ! -e "$p" ]; then echo "deleted  ~${p#$HOME}"
+  else echo "FAILED   ~${p#$HOME}  (quit that app first, or give Terminal Full Disk Access)"; fi
+done
+after=$(df -k / | awk 'NR==2{print $4}')
+echo; echo "Freed about $(human $((after - before > 0 ? after - before : 0))). Free space now: $(human "$after")"
+echo "Tip: leftover app data may also sit in /Library (system-wide); that needs sudo and isn't touched."
